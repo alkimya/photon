@@ -26,24 +26,22 @@ def rename(img):
     """Rename an image old with new name"""
     ext = splitext(img)[1].lower()
     name = get_date(open(img))
-    print(name)
     if name is not None:
         name = name + ext
         return copy(img, name)
 
 
-def create_tree(file, dir):
+def create_tree(file, rep):
     """Create the tree structure of folders of images"""
     try:
         if file is not None:
-            print(file)
-            dir = dir + '/' + file[0:4] + '/' + file[0:6] + '/' + file[0:8]
-            if not exists(dir):
-                makedirs(dir)
-                move(file, dir)
+            rep = rep + '/' + file[0:4] + '/' + file[0:6] + '/' + file[0:8]
+            if not exists(rep):
+                makedirs(rep)
+                move(file, rep)
             else:
-                if not exists(dir + '/' + file):
-                    move(file, dir)
+                if not exists(rep + '/' + file):
+                    move(file, rep)
                 else:
                     print('Already exists!')
     except OSError:
@@ -61,7 +59,9 @@ def copy_photos(source=".", dest="."):
             else:
                 if guess_type(child)[0] is not None \
                         and (guess_type(child)[0].split('/')[0] == 'image'):
-                    print(child)
                     new = rename(child)
                     create_tree(new, dest)
 
+
+if __name__ == '__main__':
+    copy_photos('/home/loc/photos', '/home/loc/photos2')
