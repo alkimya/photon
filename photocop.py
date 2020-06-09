@@ -37,7 +37,7 @@ def create_tree(file, dir):
     try:
         if file is not None:
             print(file)
-            dir = dir + '/' + file[0:4] + '/' + file[4:6] + '/' + file[6:8]
+            dir = dir + '/' + file[0:4] + '/' + file[0:6] + '/' + file[0:8]
             if not exists(dir):
                 makedirs(dir)
                 move(file, dir)
