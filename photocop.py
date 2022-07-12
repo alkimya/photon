@@ -1,7 +1,12 @@
 from mimetypes import guess_type
-from os import listdir, makedirs
-from os.path import splitext, exists, isdir, join
-from shutil import copy, move
+from os import listdir
+from os import makedirs
+from os.path import exists
+from os.path import isdir
+from os.path import join
+from os.path import splitext
+from shutil import copy
+from shutil import move
 
 from PIL.Image import open
 
@@ -11,7 +16,7 @@ def get_date(img):
     exif = img.getexif()
     date = exif.get(306)
     if date is not None:
-        date = date.replace(" ", "-").replace(":", "")
+        date = date.replace(' ', '-').replace(':', '')
     return date
 
 
@@ -48,7 +53,7 @@ def create_tree(file, rep):
         print('Argh! I could not create the directory!')
 
 
-def copy_photos(source=".", dest="."):
+def copy_photos(source='.', dest='.'):
     """Copy all images from a directory tree dir to a destination dest"""
     if isdir(source):  # if this is a directory,
         for child in listdir(source):
@@ -64,4 +69,4 @@ def copy_photos(source=".", dest="."):
 
 
 if __name__ == '__main__':
-    copy_photos('/home/loc/photos', '/home/loc/photos2')
+    copy_photos('/home/loc/tmp', '/home/loc/media/images/photos')
