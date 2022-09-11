@@ -1,245 +1,425 @@
 # /usr/bin/python3
 from argparse import Namespace
+from asyncio import gather, run
 from mimetypes import guess_type
-import os
+from os import getenv, listdir
+from os.path import dirname, isdir, isfile, join as concat
 import sys
 
 import gi
+gi.require_version('Adw', '1')
+gi.require_version('Gdk', '4.0')
+gi.require_version('GdkPixbuf', '2.0')
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gtk, Gdk, GdkPixbuf
-from PIL.ExifTags import TAGS
-from PIL import Image
+from gi.repository.Gdk import ModifierType, Surface, keyval_name
+from gi.repository.Gio import Cancellable, File 
+from gi.repository.Gtk import (
+    AboutDialog, ApplicationWindow, Button, CellRendererText, CellRendererPixbuf, CheckButton, Dialog,
+    EventControllerKey, FileChooserAction, FileChooserNative, FileFilter, HeaderBar, IconTheme, Label, License,
+    ResponseType, ScrolledWindow, SortType, TextView, TreeIter, TreeStore, TreeView, TreeViewColumn, Orientation, 
+    Paned, Picture, Viewport)
+from gi.repository.Adw import Application, ColorScheme
 
+from pillow import (
+    UnsharpMask, get_date, has_exif, imread, magic_enhance, exif_table, resize, rotate, simple_filter, to_pix, 
+    BLUR, CONTOUR, DETAIL, EDGE_ENHANCE, EDGE_ENHANCE_MORE, EMBOSS, FIND_EDGES, SHARPEN, SMOOTH, SMOOTH_MORE, 
+    MinFilter, MaxFilter, MedianFilter, UnsharpMask)
 from profile import timing
 
 n = Namespace()
-n.pixbuf_center = GdkPixbuf.Pixbuf()
-n.pixbuf_prev = GdkPixbuf.Pixbuf()
-n.pixbuf_next = GdkPixbuf.Pixbuf()
-n.pixbuf_wip = GdkPixbuf.Pixbuf()
-n.photo = Gtk.Picture()
 n.shrinkable = True
-n.itr_photo = Gtk.TreeIter()
-n.itr_row = Gtk.TreeIter()
-n.index = 0
 n.fullscreen = False
-n.evk = Gtk.EventControllerKey()
-n.store = Gtk.TreeStore(str, str, str)
-n.PHOTON = '/home/loc/media/images/photos'
+n.dark_theme = False
+n.dont_ask = False
+n.pane_visible = False
+n.exif_view = False
+n.quality = 95
 
+photo = Picture()
+store = TreeStore(str, str, str)
+n.itr_photo = TreeIter()
+n.itr_row = TreeIter()
+n.photos = []
 
-class AppWindow(Gtk.ApplicationWindow):
+PHOTON = getenv('PHOTON') or getenv('XDG_PICTURES_DIR')
+n.path = PHOTON
+class AppWindow(ApplicationWindow):
     """dev mode"""
 
     def __init__(self, *args, **kwargs):
         """dev mode"""
         super().__init__(*args, **kwargs)
 
-        n.pixbuf_center = GdkPixbuf.Pixbuf().new_from_file('/home/loc/media/images/spring.jpg')
-        n.theme = Gtk.IconTheme()
-        n.theme.set_theme_name('Yaru')
+        theme = IconTheme()
+        theme.set_theme_name('Adwaita')
 
-        n.header = Gtk.HeaderBar()
-        self.set_titlebar(n.header)
+        header = HeaderBar()
+        self.set_titlebar(header)
 
-        n.home_button = Gtk.Button(label='Home')
-        n.home_button.set_icon_name('go-home-symbolic')
-        n.home_button.connect('clicked', self.home_button_clicked)
+        sidebar_button = Button(label='Sidebar')
+        sidebar_button.set_icon_name('sidebar-show-symbolic')
+        sidebar_button.connect('clicked', self.sidebar_button_clicked)
 
-        n.open_folder_button = Gtk.Button(label='Open')
-        n.open_folder_button.set_icon_name('filemanager-app-symbolic')
-        n.open_folder_button.connect('clicked', self.open_folder_button_clicked)
+        tview_button = Button(label='Toggle View')
+        tview_button.set_icon_name('view-dual-symbolic')
+        tview_button.connect('clicked', self.tview_button_clicked)
 
-        n.open_folder_dialog = Gtk.FileChooserNative.new(
-            title='Choose a folder full of photos!', parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
+        home_button = Button(label='Home')
+        home_button.set_icon_name('go-home-symbolic')
+        home_button.connect('clicked', self.home_button_clicked)
+
+        open_folder_button = Button(label='Open')
+        open_folder_button.set_icon_name('folder-symbolic')
+        open_folder_button.connect('clicked', self.open_folder_button_clicked)
+
+        n.open_folder_dialog = FileChooserNative.new('Open a folder', self, FileChooserAction.SELECT_FOLDER)
         n.open_folder_dialog.connect('response', self.open_folder_dialog_response)
 
-        treepath_walk(n.PHOTON)
+        enhance_button = Button(label='Enhance')
+        enhance_button.set_icon_name('image-auto-adjust-symbolic')
+        enhance_button.connect('clicked', self.enhance_button_clicked)
 
-        n.about_button = Gtk.Button(label='About')
-        n.about_button.set_icon_name('help-about-symbolic')
-        n.about_button.connect('clicked', self.about_button_clicked)
+        prefs_button = Button(label='Preferences')
+        prefs_button.set_icon_name('applications-system-symbolic')
 
-        n.prefs_button = Gtk.Button(label='Preferences')
-        n.prefs_button.set_icon_name('tweaks-app-symbolic')
+        about_button = Button(label='About')
+        about_button.set_icon_name('dialog-information-symbolic')
+        about_button.connect('clicked', self.about_button_clicked)
 
-        n.header.pack_start(n.home_button)
-        n.header.pack_start(n.open_folder_button)
-        n.header.pack_start(n.prefs_button)
-        n.header.pack_start(n.about_button)
+        header.pack_start(sidebar_button)
+        header.pack_start(tview_button)
+        header.pack_start(home_button)
+        header.pack_start(open_folder_button)
+        header.pack_start(enhance_button)
+        header.pack_start(prefs_button)
+        header.pack_start(about_button)
 
-        n.hpane = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        hpane = Paned.new(Orientation.HORIZONTAL)
 
-        n.vpane = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        n.sidebar = Paned.new(Orientation.VERTICAL)
 
-        n.treeview = Gtk.TreeView().new_with_model(n.store)
-        n.col = Gtk.TreeViewColumn('Photos tree :')
-        n.coltext = Gtk.CellRendererText()
-        n.colimg = Gtk.CellRendererPixbuf()
-        n.col.pack_start(n.colimg, True)
-        n.col.pack_start(n.coltext, True)
-        n.col.add_attribute(n.colimg, 'icon-name', 0)
-        n.col.add_attribute(n.coltext, 'text', 1)
-        n.store.set_sort_column_id(1, Gtk.SortType.ASCENDING)
-        n.treeview.append_column(n.col)
-        n.treeview.set_activate_on_single_click(True)
-        n.treeview.set_headers_visible(False)
-        n.treeview.connect('row_activated', self.treeview_row_activated)
-        n.treeview.connect('row_expanded', self.treeview_row_expanded)
-        n.treeview.connect('row_collapsed', self.treeview_row_collapsed)
+        n.tview = TreeView().new_with_model(store)
+        n.col = TreeViewColumn('File System view :')
+        colimg = CellRendererPixbuf()
+        coltext = CellRendererText()
+        n.col.pack_start(colimg, True)
+        n.col.pack_start(coltext, True)
+        n.col.add_attribute(colimg, 'icon-name', 0)
+        n.col.add_attribute(coltext, 'text', 1)
+        store.set_sort_column_id(1, SortType.ASCENDING)
+        n.tview.append_column(n.col)
+        n.tview.set_activate_on_single_click(True)
+        n.tview.connect('row_activated', self.tview_row_activated)
+        n.tview.connect('row_expanded', self.tview_row_expanded)
+        n.tview.connect('row_collapsed', self.tview_row_collapsed)
+        tscroll = ScrolledWindow()
+        tscroll.set_child(n.tview)
+        n.tview.set_has_tooltip(False)
 
-        n.scrolltree = Gtk.ScrolledWindow()
-        n.scrolltree.set_child(n.treeview)
+        textview = TextView()
+        n.buffer = textview.get_buffer()
+        scrolltext = ScrolledWindow()
+        scrolltext.set_child(textview)
 
-        n.textview = Gtk.TextView()
-        n.buffer = n.textview.get_buffer()
-        n.buffer.set_text("Life is short, learn Python!")
-        n.scrolltext = Gtk.ScrolledWindow()
-        n.scrolltext.set_child(n.textview)
+        n.sidebar.set_start_child(tscroll)
+        n.sidebar.set_end_child(scrolltext)
 
-        n.vpane.set_start_child(n.scrolltree)
-        n.vpane.set_end_child(n.scrolltext)
+        photo.set_can_shrink(n.shrinkable)
 
-        n.photo.set_can_shrink(n.shrinkable)
-        n.photo.set_pixbuf(n.pixbuf_center)
-        n.viewport = Gtk.Viewport()
-        n.viewport.set_scroll_to_focus(True)
-        n.scrollport = Gtk.ScrolledWindow()
-        n.scrollport.set_child(n.photo)
-        n.viewport.set_child(n.scrollport)
+        viewport = Viewport()
+        viewport.set_scroll_to_focus(True)
+        scrollport = ScrolledWindow()
+        scrollport.set_child(photo)
+        viewport.set_child(scrollport)
 
-        n.hpane.set_start_child(n.vpane)
-        n.hpane.set_end_child(n.viewport)
-        n.hpane.set_position(216)
+        width, height = self.screen_size()
 
-        n.evk.connect('key-pressed', self.key_pressed)
-        self.add_controller(n.evk)
+        hpane.set_start_child(n.sidebar)
+        hpane.set_end_child(viewport)
+        hpane.set_position(int(width*0.15))
 
-        self.set_child(n.hpane)
+        evk = EventControllerKey()
+        evk.connect('key-pressed', self.key_pressed)
+        self.add_controller(evk)
+
+        self.set_child(hpane)
         self.set_icon_name('photon')
         self.maximize()
 
-        #self.get_settings().set_property('gtk-application-prefer-dark-theme', True)
+        self.set_size_request(int(width/2), int(height/2))
+        
+        n.buffer.set_text(f"Size of the screen : {width} x {height} px")
+        self.set_has_tooltip(False)
+
+    def sidebar_button_clicked(self, button):
+        self.toggle_pane_visible()
+
+    def tview_button_clicked(self, button):
+        self.toggle_view()
 
     def home_button_clicked(self, button):
-        n.store.clear()
-        treepath_walk(n.PHOTON)
+        store.clear()
+        n.photos.clear()
+        run(fs_walk(PHOTON))
 
     def open_folder_button_clicked(self, button):
         n.open_folder_dialog.show()
 
     def open_folder_dialog_response(self, dialog, response):
-        if response == Gtk.ResponseType.ACCEPT:
-            n.store.clear()
-            treepath_walk(dialog.get_file().get_path())
+        if response == ResponseType.ACCEPT:
+            n.path = dialog.get_file().get_path()
+            if n.exif_view:
+                self.toggle_view()
+            else:
+                store.clear()
+                n.photos.clear()
+                run(fs_walk(n.path))
+
+    @timing
+    def enhance_button_clicked(self, button):
+        self.magic_enhance_pix()
 
     def about_button_clicked(self, button):
-        n.about = Gtk.AboutDialog()
-        n.about.set_transient_for(self)
-        n.about.set_modal(self)
-        n.about.set_logo_icon_name('photon')
-        n.about.set_comments('Photo manager in PyGtk4')
-        n.about.set_authors(['Loc Cosnier aka alkimya\nloc.cosnier@pm.me'])
-        n.about.set_copyright('Copyright 2022 Loc Cosnier')
-        n.about.set_license_type(Gtk.License.MIT_X11)
+        about = AboutDialog()
+        about.set_transient_for(self)
+        about.set_modal(self)
+        about.set_program_name('Photon')
+        about.set_version('0.1dev')
+        about.set_logo_icon_name('photon')
+        about.set_comments('Photo manager in GTK4-PyGObject')
+        about.set_authors(['Loc Cosnier aka alkimya\nloc.cosnier@pm.me'])
+        about.set_website('https://github.com/alkimya/photon')
+        about.set_website_label('Photon website')
+        about.set_copyright('Copyright 2022 Loc Cosnier')
+        about.set_license_type(License.GPL_3_0)
 
-        n.about.set_version('0.1dev')
+        about.show()
 
-        n.about.show()
-
-    def treeview_row_activated(self, treeview, path, column):
+    def tview_row_activated(self, treeview, path, column):
         """dev mode"""
-        n.itr_row = n.store.get_iter(path)
-        url = n.store.get_value(n.itr_row, 2)
-        if is_file(url):
-            n.itr_photo = n.itr_row
-            n.pixbuf_center = GdkPixbuf.Pixbuf().new_from_file(url)
-            n.pixbuf_wip = n.pixbuf_center
-            n.photo.set_pixbuf(n.pixbuf_center)
-            n.buffer.set_text(exif_table(url))
-            itr_parent = n.store.iter_parent(n.itr_photo)
-            num = n.store.iter_n_children(itr_parent)
-            match num:
-                case 1:
-                    n.pixbuf_prev = n.pixbuf_next = n.pixbuf_center
-                case 2:
-                    new_itr = n.store.iter_next(
-                        n.itr_row) if n.store.iter_next(
-                        n.itr_row) else n.store.iter_previous(
-                        n.itr_row)
-                    new_url = n.store.get_value(new_itr, 2)
-                    n.pixbuf_prev = n.pixbuf_next = GdkPixbuf.Pixbuf().new_from_file(new_url)
-                case _:
-                    itr_prev = n.store.iter_previous(
-                        n.itr_photo) if n.store.iter_previous(
-                        n.itr_photo) else iter_last_child(itr_parent)
-                    itr_next = n.store.iter_next(
-                        n.itr_photo) if n.store.iter_next(
-                        n.itr_photo) else iter_first_child(itr_parent)
-                    url_prev = n.store.get_value(itr_prev, 2)
-                    url_next = n.store.get_value(itr_next, 2)
-                    n.pixbuf_prev = GdkPixbuf.Pixbuf().new_from_file(url_prev)
-                    n.pixbuf_next = GdkPixbuf.Pixbuf().new_from_file(url_next)
-        else:
-            if n.store.iter_has_child(n.itr_row):
-                itr_center = iter_first_child(n.itr_row)
-                n.itr_photo = itr_center
-                url_center = n.store.get_value(itr_center, 2)
-                n.pixbuf_center = GdkPixbuf.Pixbuf().new_from_file(url_center)
-                n.pixbuf_wip = n.pixbuf_center
-                n.photo.set_pixbuf(n.pixbuf_center)
-                n.buffer.set_text(exif_table(url_center))
-                itr_prev = iter_last_child(n.itr_row)
-                url_prev = n.store.get_value(itr_prev, 2)
-                n.pixbuf_prev = GdkPixbuf.Pixbuf().new_from_file(url_prev)
-                itr_next = iter_next_child(itr_center)
-                url_next = n.store.get_value(itr_next, 2)
-                n.pixbuf_next = GdkPixbuf.Pixbuf().new_from_file(url_next)
+        n.itr_row = store.get_iter(path)
+        url = get_url(n.itr_row)
+        if url is not None:
+            if isfile(url):
+                load_pil(n.itr_row)
+                n.itr_row = get_parent(n.itr_row)            
+            elif has_child(n.itr_row):
+                itr = first_pix(n.itr_row)
+                load_pil(itr)
             else:
-                n.pixbuf_prev = n.pixbuf_next = n.pixbuf_center = GdkPixbuf.Pixbuf()
+                n.wip = n.pix = None
+        else:
+            itr = first_pix(n.itr_row)
+            load_pil(itr)
 
-    def treeview_row_expanded(self, treeview, itr, path):
-        n.store.set_value(itr, 0, 'document-open-symbolic')
+    def tview_row_expanded(self, treeview, itr, path):
+        store.set_value(itr, 0, 'document-open-symbolic')
 
-    def treeview_row_collapsed(self, treeview, itr, path):
-        n.store.set_value(itr, 0, 'folder-new-symbolic')
+    def tview_row_collapsed(self, treeview, itr, path):
+        store.set_value(itr, 0, 'folder-new-symbolic')
+
+    def saveimg(self):
+        if n.wip != n.pix.copy() and not n.dont_ask:
+            n.saveimg_dialog = Dialog()
+            n.saveimg_dialog.set_transient_for(self)
+            n.saveimg_dialog.set_modal(True)
+            width, height = self.screen_size()
+            n.saveimg_dialog.set_size_request(int(width/10), int(height/10))
+            n.saveimg_dialog.set_title('Save the Picture')
+            label = Label.new('Do you want to overwrite the Picture ?')
+            n.saveimg_dialog.get_content_area().append(label)
+            n.saveimg_dialog.add_button('Yes', ResponseType.ACCEPT)
+            n.saveimg_dialog.add_button('No, thanks !', ResponseType.REJECT)
+            ask_button = CheckButton.new_with_label('Don\'t ask me again')
+            ask_button.set_active(n.dont_ask)
+            ask_button.connect('activate', self.ask_button_activate)
+            ask_button.connect('toggled', self.ask_button_toggled)
+            n.saveimg_dialog.connect('response', self.saveimg_dialog_response)
+            n.saveimg_dialog.get_content_area().append(ask_button)
+            n.saveimg_dialog.show()
+        elif n.wip != n.pix.copy() and n.dont_ask:
+            name = get_url(n.itr_photo)
+            n.wip.save(name, quality=n.quality)
+
+    def ask_button_activate(self, button):
+        n.dont_ask = True
+
+    def ask_button_toggled(self, button):
+        n.dont_ask = True if button.get_active() else False
+
+    def saveimg_dialog_response(self, dialog, response):
+        if response == ResponseType.ACCEPT:
+            name = get_url(n.itr_photo)
+            n.wip.save(name, quality=n.quality)
+            dialog.close()
+        elif response == ResponseType.REJECT:
+            dialog.close()
+
+    def save_asimg(self):
+        n.save_asimg_dialog = FileChooserNative.new('Save as', self, FileChooserAction.SAVE)
+        n.save_asimg_dialog.set_current_folder(File.new_for_path(dirname(get_url(n.itr_photo))))
+        file_filter = FileFilter()
+        file_filter.set_name('Image Files')
+        file_filter.add_mime_type('image/jpeg')
+        file_filter.add_mime_type('image/png')
+        n.save_asimg_dialog.add_filter(file_filter)
+        n.save_asimg_dialog.connect('response', self.save_asimg_dialog_response)
+        n.save_asimg_dialog.show()
+
+    def save_asimg_dialog_response(self, dialog, response):
+        if response == ResponseType.ACCEPT:
+            name = dialog.get_current_folder().get_path() + '/' + dialog.get_current_name()
+            n.wip.save(name, quality=n.quality)
 
     def toggle_fullscreen(self):
         n.fullscreen = not n.fullscreen
         if n.fullscreen:
-            n.vpane.set_visible(False)
+            n.sidebar.set_visible(False)
             self.fullscreen()
         else:
             self.unfullscreen()
-            n.vpane.set_visible(True)
+            n.sidebar.set_visible(True)
+
+    def toggle_dark_theme(self):
+        n.dark_theme = not n.dark_theme
+        theme = ColorScheme.FORCE_DARK if n.dark_theme else ColorScheme.FORCE_LIGHT
+        self.get_application().get_style_manager().set_color_scheme(theme)
+
+    def toggle_pane_visible(self):
+        n.pane_visible = not n.pane_visible
+        n.sidebar.set_visible(n.pane_visible)
+
+    @timing
+    def toggle_view(self):
+        n.exif_view = not n.exif_view
+        label = 'Exif Tags view : ' if n.exif_view else 'File System view : '
+        n.col.set_title(label)
+        store.clear()
+        if n.exif_view:
+            exif_walk()
+        else:
+            n.photos.clear()
+            run(fs_walk(n.path))
+
+    def move_left(self, itr):
+        move_to(itr, prev_pix)
+
+    def move_right(self, itr):
+        move_to(itr, next_pix)
+
+    def delete(self, itr):
+        file = File.new_for_path(get_url(itr))
+        file.trash()
+        if store.remove(itr):
+            load_pil(itr)
+        else:
+            itr = first_pix(get_iter(n.tview.get_cursor().path))
+            load_pil(itr)
+    
+    @timing
+    def rotate(self, angle):
+        n.wip = rotate(n.wip, angle)
+        photo.set_pixbuf(to_pix(n.wip))
+
+    @timing
+    def zoom(self, delta):
+        n.wip = resize(n.wip, map(lambda x: int(x*(1+delta)), n.wip.size))
+        photo.set_pixbuf(to_pix(n.wip))
+
+    def shrink(self):
+        n.shrinkable = not n.shrinkable
+        photo.set_can_shrink(n.shrinkable)
+
+    @timing
+    def magic_enhance_pix(self):
+        n.wip = magic_enhance(n.wip)
+        photo.set_pixbuf(to_pix(n.wip))
+
+    def apply_filter(self, fil):
+        n.wip = simple_filter(n.wip, fil)
+        photo.set_pixbuf(to_pix(n.wip))
+
+    def reinitialise(self):
+        n.wip = n.pix.copy()
+        photo.set_pixbuf(to_pix(n.wip))
+
+    def screen_size(self):
+        display = self.get_display()
+        screen = display.get_monitor_at_surface(Surface.new_toplevel(display))
+        screen_size = screen.get_geometry()
+        return (screen_size.width, screen_size.height)
 
     def key_pressed(self, event, keyval, keycode, state):
-        key = Gdk.keyval_name(keyval)
-        print(key)
-        match key:
-            case 'q':
+        key = keyval_name(keyval)
+        print(key, state)
+        match key, state:
+            case 'q', ModifierType.CONTROL_MASK:
                 self.close()
-            case 'F11':
+            case 's', ModifierType.CONTROL_MASK:
+                    self.saveimg()
+            case 's', _:
+                    self.apply_filter(SMOOTH)
+            case 'S', ModifierType.CONTROL_MASK:
+                self.save_asimg()
+            case 'S', _:
+                    self.apply_filter(SMOOTH_MORE)
+            case 'F11', _:
                 self.toggle_fullscreen()
-            case 'Left':
-                move_left(n.itr_photo)
-            case 'Right':
-                move_right(n.itr_photo)
-            case 'Delete':
-                move_right(n.itr_photo)
-            case 'r':
-                rotate(-90)
-            case 'l':
-                rotate(90)
-            case 'plus':
-                zoom(0.25)
-            case 'minus':
-                zoom(-0.25)
-            case '1':
-                reinitialise()
+            case 'Escape', _:
+                self.unfullscreen()
+                self.toggle_pane_visible()
+            case 'Left', _:
+                self.move_left(n.itr_photo)
+            case 'Right', _:
+                self.move_right(n.itr_photo)
+            case 'Delete', _:
+                self.delete(n.itr_photo)
+            case 'r', _:
+                self.rotate(-90)
+            case 'l', _:
+                self.rotate(90)
+            case 'plus', _:
+                self.zoom(0.25)
+            case 'minus', _:
+                self.zoom(-0.25)
+            case '1', _:
+                self.shrink()
+            case '0', _:
+                self.reinitialise()
+            case '2', _:
+                self.zoom(1)
+            case 'F1', _:
+                self.toggle_dark_theme()
+            case 'e', _:
+                self.apply_filter(EDGE_ENHANCE)
+            case 'E', _:
+                self.apply_filter(EDGE_ENHANCE_MORE)
+            case 'p', _:
+                self.toggle_pane_visible()
+            case 'rightdoublequotemark', _: # Alt Gr + b
+                self.apply_filter(BLUR)
+            case 'cent', _: # Alt Gr + c
+                self.apply_filter(CONTOUR)
+            case 'eth', _: # Alt Gr + d
+                self.apply_filter(DETAIL)
+            case 'EuroSign', _: # Alt Gr + e
+                self.apply_filter(EMBOSS)
+            case 'dstroke', _: # Alt Gr +f
+                self.apply_filter(FIND_EDGES)
+            case 'ssharp', _: # Alt Gr + s
+                self.apply_filter(SHARPEN)
+            case 'backslash', _: # Alt Gr + º
+                self.magic_enhance_pix()
+            case 'dead_belowdot', _: # Alt Gr + -
+                self.apply_filter(MinFilter)
+            case 'bracketright', _: # Alt Gr + +
+                self.apply_filter(MaxFilter)
+            case 'mu', _: # Alt Gr + m
+                self.apply_filter(MedianFilter)
+            case 'downarrow', _: # Alt Gr + u
+                self.apply_filter(UnsharpMask)
 
-
-class Application(Gtk.Application):
+class App(Application):
     """dev mode"""
 
     def __init__(self, *args, **kwargs):
@@ -252,148 +432,195 @@ class Application(Gtk.Application):
         if not self.window:
             self.window = AppWindow(application=self, title="Photon")
         self.window.present()
-
-
-def treepath_walk(path, parent=None):
-    """dev mode"""
-    for entry in os.listdir(path):
-        fullname = os.path.join(path, entry)
-        isfolder = is_folder(fullname)
-        img = 'folder-new-symbolic' if isfolder else 'applications-graphics-symbolic'
-        if isfolder:
-            item = n.store.append(parent, [img, entry, fullname])
-            treepath_walk(fullname, item)
-        elif is_image(fullname):
-            n.store.append(parent, [img, entry, fullname])
+        run(fs_walk(PHOTON))
 
 
 @timing
-def exif_table(url):
-    image = Image.open(url)
-    out = ''
-    for k, v in image.getexif().items():
-        out = out + str(TAGS.get(k)) + ' : ' + str(v) + '\n'
-    return out
+async def fs_walk(path, parent=None):
+    """dev mode"""
+    if path is not None:
+        async def process(entry):
+            fullname = concat(path, entry)
+            icon = 'folder-new-symbolic' if isdir(fullname) else 'applications-graphics-symbolic'
+            if isdir(fullname):
+                item = store.append(parent, [icon, entry, fullname])
+                await fs_walk(fullname, item)
+            elif is_image(fullname):
+                store.append(parent, [icon, entry, fullname])
+                n.photos.append((entry, fullname))
+        await gather(*map(process, listdir(path)))
+
+@timing
+def exif_walk():
+    """dev mode"""
+    exifs = dict(filter(lambda x: has_exif(x[1]), n.photos))
+    no_exifs = dict(_ for _ in n.photos if not has_exif(_[1]))
+    uniques = dict((get_date(imread(_)), _) for _ in exifs.values())
+    print(len(n.photos), len(exifs), len(no_exifs), len(uniques))
+    pictures = set(uniques.keys())
+    for year in set(pic[0:4] for pic in pictures):
+        y_itr = store.append(None, ['folder-new-symbolic', year, None])
+        for month in set(pic[0:6] for pic in pictures):
+            if year in month:
+                m_itr = store.append(y_itr, ['folder-new-symbolic', month[4:6], None])
+                for day in set(pic[0:8] for pic in pictures):
+                    if month in day:
+                        d_itr = store.append(m_itr, ['folder-new-symbolic', day[6:8], None])
+                        for pic in pictures:
+                            if day in pic:
+                                store.append(d_itr, ['applications-graphics-symbolic', pic, uniques[pic]])
+    if len(no_exifs) != 0:
+        itr = store.append(None, ['folder-new-symbolic', '¯\_(ツ)_/¯', None])
+    for key, value in no_exifs.items():
+        store.append(itr, ['applications-graphics-symbolic', key, value])
+    text = f"Numbers of pictures : {len(n.photos)}\nNumbers of pictures with exifs data : {len(exifs)}\nNumbers of unique pictures with exifs data : {len(uniques)}"
+    n.buffer.set_text(text)
+
+
+
+
+def get_name(itr):
+    """Retrieve the basename of the picture file stored in the TreeStore"""
+    return store.get_value(itr, 1)
+
+
+def get_url(itr):
+    """Retrieve the url of the picture stored in the TreeStore"""
+    return store.get_value(itr, 2)
 
 
 def is_image(url):
-    mimetype = guess_type(url)[0]
-    if mimetype is not None:
-        if mimetype.split('/')[0] == 'image':
+    """Test if a file has an image mime type as JPEG or PNG"""
+    match guess_type(url)[0].split('/')[-1]:
+        case 'jpeg' | 'png':
             return True
-    return False
+        case _:
+            return False
 
 
-def is_file(url):
-    return os.path.isfile(url)
-
-
-def is_folder(url):
-    return os.path.isdir(url)
+def first():
+    """Retrieve the TreeIter of the first node of the TreeStore"""
+    return store.get_iter_first()
 
 
 def has_nodes(itr):
-    if n.store.iter_has_child(itr):
-        for n in n.store.iter_n_children(itr):
-            if n.store.iter_nth_child(itr, n):
+    """Test if a node of the TreeStore has nodes (non empty children)"""
+    if has_child(itr):
+        for _ in n_children(itr):
+            if nth_child(itr, _):
                 return True
     return False
 
 
-def iter_first_child(itr):
-    new_itr = n.store.iter_nth_child(itr, 0)
-    url = n.store.get_value(new_itr, 2)
-    if is_file(url):
-        return new_itr
-    elif n.store.iter_has_child(new_itr):
-        return iter_first_child(new_itr)
+def has_child(itr):
+    """Test if a node of the TreeStore is empty, without child, or not"""
+    return store.iter_has_child(itr)
 
 
-def iter_last_child(itr):
-    num = n.store.iter_n_children(itr)
-    new_itr = n.store.iter_nth_child(itr, num-1)
-    url = n.store.get_value(new_itr, 2)
-    if is_file(url):
-        return new_itr
-    elif n.store.iter_has_child(new_itr):
-        return iter_last_child(new_itr)
+def n_children(itr):
+    """Return the number of children of a node"""
+    return store.iter_n_children(itr)
 
 
-def iter_next_child(itr):
-    itr_parent = n.store.iter_parent(itr)
-    if itr_next := n.store.iter_next(itr):
-        if is_file(n.store.get_value(itr_next, 2)):
-            return itr_next
-        return iter_first_child(itr_next)
-    elif is_file(n.store.get_value(n.itr_row, 2)):
-        return iter_first_child(itr_parent)
-    elif n.store.get_value(itr_parent, 2) != n.store.get_value(n.itr_row, 2):
-        if itr_next := n.store.iter_next(itr_parent):
-            iter_first_child(itr_next)
-    return iter_first_child(n.itr_row)
+def nth_child(itr, ind):
+    """Retrieve the nth child of itr"""
+    return store.iter_nth_child(itr, ind)
 
 
-def iter_prev_child(itr):
-    itr_parent = n.store.iter_parent(itr)
-    if itr_prev := n.store.iter_previous(itr):
-        if is_file(n.store.get_value(itr_prev, 2)):
-            return itr_prev
-        return iter_last_child(itr_prev)
-    elif is_file(n.store.get_value(n.itr_row, 2)):
-        return iter_last_child(itr_parent)
-    elif n.store.get_value(itr_parent, 2) != n.store.get_value(n.itr_row, 2):
-        if itr_prev := n.store.iter_previous(itr_parent):
-            iter_last_child(itr_prev)
-
-    return iter_last_child(n.itr_row)
+def get_parent(itr):
+    return store.iter_parent(itr)
 
 
-@timing
-def move_left(itr):
-    n.photo.set_pixbuf(n.pixbuf_prev)
-    n.pixbuf_next = n.pixbuf_center
-    n.pixbuf_center = n.pixbuf_prev
-    n.pixbuf_wip = n.pixbuf_center
-    n.pixbuf_prev = GdkPixbuf.Pixbuf().new_from_file(n.store.get_value(iter_prev_child(itr), 2))
-    n.itr_photo = iter_prev_child(itr)
-    n.buffer.set_text(exif_table(n.store.get_value(n.itr_photo, 2)))
+def next(itr):
+    return store.iter_next(itr)
 
 
-@timing
-def move_right(itr):
-    n.photo.set_pixbuf(n.pixbuf_next)
-    n.pixbuf_prev = n.pixbuf_center
-    n.pixbuf_center = n.pixbuf_next
-    n.pixbuf_wip = n.pixbuf_center
-    n.pixbuf_next = GdkPixbuf.Pixbuf().new_from_file(n.store.get_value(iter_next_child(itr), 2))
-    n.itr_photo = iter_next_child(itr)
-    n.buffer.set_text(exif_table(n.store.get_value(n.itr_photo, 2)))
+def previous(itr):
+    return store.iter_previous(itr)
 
 
-@timing
-def rotate(delta):
-    n.pixbuf_wip = n.pixbuf_wip.rotate_simple(delta % 360)
-    n.photo.set_pixbuf(n.pixbuf_wip)
+def get_path(itr):
+    return store.get_path(itr)
 
 
-@timing
-def zoom(delta):
-    width = n.pixbuf_wip.get_width()
-    height = n.pixbuf_wip.get_height()
-    width = int(width * (1 + delta))
-    height = int(height * (1 + delta))
-    n.pixbuf_wip = n.pixbuf_wip.scale_simple(width, height, GdkPixbuf.InterpType.BILINEAR)
-    n.photo.set_pixbuf(n.pixbuf_wip)
+def get_iter(path):
+    return store.get_iter(path)
 
 
-@timing
-def reinitialise():
-    n.shrinkable = not n.shrinkable
-    n.pixbuf_wip = n.pixbuf_center
-    n.photo.set_pixbuf(n.pixbuf_wip)
-    n.photo.set_can_shrink(n.shrinkable)
+def set_cursor(itr):
+    expand(itr)
+    n.tview.set_cursor(get_path(itr), n.col, False)
+    
 
+def expand(itr):
+    n.tview.expand_to_path(get_path(itr))
+
+
+def edging(itr, nth):
+    itr = nth_child(itr, nth)
+    url = get_url(itr)
+    if url is not None and isfile(url):
+        return itr
+    elif has_child(itr):
+        n.tview.expand_to_path(get_path(itr))
+        nth = 0 if nth == 0 else n_children(itr)-1
+        return edging(itr, nth)
+
+
+def first_pix(itr):
+    return edging(itr, 0)
+
+
+def last_pix(itr):
+    return edging(itr, n_children(itr)-1)
+
+
+def centering(itr, center, edge):
+    itr_parent = get_parent(itr)
+    if itr := center(itr):
+        if isfile(get_url(itr)):
+            return itr
+        return edge(itr)
+    elif isfile(get_url(n.itr_row)):
+        return edge(itr_parent)
+    elif get_url(itr_parent) != get_url(n.itr_row):
+        if itr := center(itr_parent):
+            return edge(itr)
+    return edge(n.itr_row)
+
+
+def prev_pix(itr):
+    return centering(itr, previous, last_pix)
+
+
+def next_pix(itr):
+    return centering(itr, next, first_pix)
+
+
+def move_to(itr, callback):
+    itr = callback(itr)
+    load_pil(itr)
+
+
+def expand_parents(itr):
+    n.tview.expand_row(get_path(itr), False)
+    if get_url(get_parent(itr)) != get_url(n.itr_row):
+        expand_parents(get_parent(itr))
+
+
+def repr_itr(itr):
+    return store.get_string_from_iter(itr)
+
+def load_pil(itr):
+    url = get_url(itr)
+    n.pix = imread(url)
+    n.wip = n.pix.copy()
+    photo.set_pixbuf(to_pix(n.wip))
+    n.buffer.set_text(exif_table(url))
+    set_cursor(itr)
+    n.itr_photo = itr
+    
 
 if __name__ == "__main__":
-    app = Application()
+    app = App()
     app.run(sys.argv)

@@ -61,9 +61,8 @@ def copy_photos(dir=".", dest="."):
             if isdir(child):
                 copy_photos(child, dest)
             else:
-                if guess_type(child)[0] != None and (guess_type(child)[0].split('/')[0] == 'image'):
+                if guess_type(child)[0] is not None and (guess_type(child)[0].split('/')[0] == 'image'):
                     new = rename(child)
-                    #print(new)
                     create_tree(new, dest)
 
 

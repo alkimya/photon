@@ -40,7 +40,7 @@ def create_tree(file, rep):
     """Create the tree structure of folders of images"""
     try:
         if file is not None:
-            rep = rep + '/' + file[0:4] + '/' + file[0:6] + '/' + file[0:8]
+            rep = rep + '/' + file[0:4] + '/' + file[4:6] + '/' + file[6:8]
             if not exists(rep):
                 makedirs(rep)
                 move(file, rep)
@@ -69,4 +69,4 @@ def copy_photos(source='.', dest='.'):
 
 
 if __name__ == '__main__':
-    copy_photos('/home/loc/tmp', '/home/loc/media/images/photos')
+    copy_photos('/home/loc/tmp', '/home/loc/tmp2')
