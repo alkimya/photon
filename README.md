@@ -9,3 +9,5 @@ Still a lot to do ...
 At the moment, most of the features are done with keyboard shortcuts.
 
 ![Photon](res/photon.png)
+
+![Photon dark mode](res/photon-dark.png)
